@@ -1,0 +1,40 @@
+{
+  "$schema": "https://docs.renovatebot.com/renovate-schema.json",
+  "extends": [
+    "config:recommended",
+    "docker:pinDigests",
+    "helpers:pinGitHubActionDigests",
+    ":semanticCommitsDisabled"
+  ],
+  "labels": ["dependencies"],
+  "customManagers": [
+    {
+      "customType": "regex",
+      "description": "Pi version in the Dockerfile ARG (single source of truth for the image's Pi version)",
+      "managerFilePatterns": ["/(^|/)Dockerfile$/"],
+      "matchStrings": [
+        "# renovate: datasource=(?<datasource>\\S+) depName=(?<depName>\\S+)\\s+ARG PI_VERSION=(?<currentValue>\\S+)"
+      ]
+    }
+  ],
+  "packageRules": [
+    {
+      "description": "Keep the base image on Node 24 / bookworm-slim; only bump the digest",
+      "matchDatasources": ["docker"],
+      "matchPackageNames": ["node"],
+      "matchUpdateTypes": ["major"],
+      "enabled": false
+    },
+    {
+      "description": "Group GitHub Actions digest/version bumps",
+      "matchManagers": ["github-actions"],
+      "groupName": "github actions"
+    },
+    {
+      "description": "Pi version bumps: after merging, push a v<version>-1 tag to release",
+      "matchDepNames": ["@earendil-works/pi-coding-agent"],
+      "commitMessageTopic": "Pi",
+      "prBodyNotes": ["After merging, release with: `git tag v{{{newVersion}}}-1 && git push origin v{{{newVersion}}}-1`"]
+    }
+  ]
+}

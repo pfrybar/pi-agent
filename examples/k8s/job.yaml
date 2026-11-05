@@ -1,0 +1,138 @@
+# One-shot Pi run as a Kubernetes Job.
+#
+# Pi has NO tool-approval gate: bash/edit/write run without asking. This pod is
+# the sandbox. Everything below is about keeping it small: non-root, no
+# capabilities, read-only root filesystem, no service-account token, a
+# throwaway workspace, and (with networkpolicy.yaml) restricted egress.
+#
+# Prerequisite (the API key lives only in this Secret, never in the image):
+#   kubectl create secret generic pi-agent-api-keys \
+#     --from-literal=ANTHROPIC_API_KEY="sk-ant-..."
+#
+# Run:
+#   kubectl apply -f examples/k8s/job.yaml
+#   kubectl logs -f job/pi-agent-run -c pi        # JSONL events (--mode json)
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: pi-agent-config
+  labels:
+    app.kubernetes.io/name: pi-agent
+data:
+  # Copied into a writable emptyDir at startup (Pi writes to its agent dir).
+  # Never put credentials here; use the Secret.
+  settings.json: |
+    {
+      "$schema": "https://pi.dev/schemas/settings.schema.json",
+      "defaultProvider": "anthropic",
+      "defaultModel": "claude-sonnet-5-5",
+      "defaultThinkingLevel": "medium",
+      "defaultProjectTrust": "never"
+    }
+---
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: pi-agent-run
+  labels:
+    app.kubernetes.io/name: pi-agent
+spec:
+  backoffLimit: 1                 # at most one retry; agent runs are not idempotent
+  activeDeadlineSeconds: 1800     # hard wall-clock cap (30 min) for the whole Job
+  ttlSecondsAfterFinished: 3600   # garbage-collect the Job and its pod after 1 hour
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: pi-agent   # selected by networkpolicy.yaml
+    spec:
+      restartPolicy: Never
+      automountServiceAccountToken: false  # no Kubernetes API credentials in the pod
+      enableServiceLinks: false            # don't inject env vars for every Service
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 1000
+        runAsGroup: 1000
+        fsGroup: 1000
+        seccompProfile:
+          type: RuntimeDefault
+
+      initContainers:
+        # 1. Clone the target repository into the shared workspace.
+        #    Reuses the pi-agent image (it ships git), with the same restrictions.
+        - name: clone
+          image: ghcr.io/pfrybar/pi-agent:1.5.0-1
+          command: ["git"]
+          args: ["clone", "--depth=1", "--branch=$(GIT_REF)", "$(GIT_REPO)", "/workspace"]
+          env:
+            - name: GIT_REPO
+              value: https://github.com/earendil-works/pi.git
+            - name: GIT_REF
+              value: main
+          securityContext: &restricted
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+          resources: &small
+            requests: { cpu: 100m, memory: 128Mi }
+            limits: { cpu: "1", memory: 512Mi }
+          volumeMounts:
+            - { name: workspace, mountPath: /workspace }
+            - { name: home, mountPath: /home/node }
+            - { name: tmp, mountPath: /tmp }
+
+        # 2. Copy read-only ConfigMap config into a writable agent dir.
+        - name: config
+          image: ghcr.io/pfrybar/pi-agent:1.5.0-1
+          command: ["cp"]
+          args: ["-L", "/config/settings.json", "/pi-agent/settings.json"]
+          securityContext: *restricted
+          resources: *small
+          volumeMounts:
+            - { name: config, mountPath: /config, readOnly: true }
+            - { name: pi-agent-dir, mountPath: /pi-agent }
+
+      containers:
+        - name: pi
+          image: ghcr.io/pfrybar/pi-agent:1.5.0-1
+          # ENTRYPOINT is `pi`; Kubernetes expands $(PI_PROMPT) from env below.
+          # --no-approve: never load .pi/ extensions/settings from the cloned repo.
+          # NOTE: with --mode json, a failed model call (bad key, rate limit, ...) is
+          # reported in the event stream (agent_end stopReason "error") but Pi still
+          # exits 0, so the Job shows Complete. Check the events, or drop
+          # "--mode json" so -p exits nonzero on errors.
+          args: ["-p", "--no-session", "--mode", "json", "--no-approve", "$(PI_PROMPT)"]
+          env:
+            - name: PI_PROMPT
+              value: >-
+                Read the README and summarize what this repository does in five bullet points.
+            - name: PI_CODING_AGENT_DIR
+              value: /pi-agent
+            - name: ANTHROPIC_API_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: pi-agent-api-keys
+                  key: ANTHROPIC_API_KEY
+          securityContext: *restricted
+          resources:
+            requests: { cpu: 250m, memory: 512Mi }
+            limits: { cpu: "2", memory: 2Gi, ephemeral-storage: 2Gi }
+          volumeMounts:
+            - { name: workspace, mountPath: /workspace }
+            - { name: pi-agent-dir, mountPath: /pi-agent }
+            - { name: home, mountPath: /home/node }
+            - { name: tmp, mountPath: /tmp }
+
+      volumes:
+        - name: workspace
+          emptyDir: { sizeLimit: 1Gi }
+        - name: pi-agent-dir
+          emptyDir: { sizeLimit: 256Mi }
+        - name: home        # writable $HOME (git, npm caches) despite read-only rootfs
+          emptyDir: { sizeLimit: 256Mi }
+        - name: tmp
+          emptyDir: { sizeLimit: 512Mi }
+        - name: config
+          configMap:
+            name: pi-agent-config

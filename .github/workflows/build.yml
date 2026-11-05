@@ -1,0 +1,72 @@
+name: build
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: build-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Lint Dockerfile
+        uses: hadolint/hadolint-action@06be81baf89a55ffd0e24b8f04a4185738dd3387 # v3.5.0
+        with:
+          dockerfile: Dockerfile
+          config: .hadolint.yaml
+
+  build:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        platform: [linux/amd64, linux/arm64]
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Read PI_VERSION from Dockerfile
+        id: ver
+        run: |
+          pi_version="$(sed -n 's/^ARG PI_VERSION=//p' Dockerfile)"
+          test -n "$pi_version"
+          echo "pi=$pi_version" >> "$GITHUB_OUTPUT"
+
+      - uses: docker/setup-qemu-action@99012661954931238ded8c8b007157a8430204e1 # v4.4.0
+      - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+
+      - name: Build (${{ matrix.platform }})
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
+        with:
+          context: .
+          platforms: ${{ matrix.platform }}
+          load: true
+          push: false
+          tags: pi-agent:ci
+          cache-from: type=gha,scope=${{ matrix.platform }}
+          cache-to: type=gha,mode=max,scope=${{ matrix.platform }}
+
+      - name: Smoke test (${{ matrix.platform }})
+        env:
+          PLATFORM: ${{ matrix.platform }}
+          EXPECTED: ${{ steps.ver.outputs.pi }}
+        run: |
+          set -euo pipefail
+          got="$(docker run --rm --platform "$PLATFORM" pi-agent:ci --version)"
+          echo "pi --version => $got"
+          test "$got" = "$EXPECTED"
+          # Runs as the non-root node user, and the bundled tools are present.
+          test "$(docker run --rm --platform "$PLATFORM" --entrypoint id pi-agent:ci -u)" = 1000
+          docker run --rm --platform "$PLATFORM" --entrypoint bash pi-agent:ci \
+            -c 'git --version && rg --version | head -1 && fd --version && test -w "$PI_CODING_AGENT_DIR" && test -w /workspace'

@@ -1,0 +1,128 @@
+name: release
+
+on:
+  push:
+    tags: ['v*']
+
+permissions: {}
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  REGISTRY: ghcr.io
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write       # push to GHCR
+      id-token: write       # OIDC for attestations and cosign keyless signing
+      attestations: write   # actions/attest-build-provenance
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Validate tag against PI_VERSION
+        id: ver
+        env:
+          TAG: ${{ github.ref_name }}
+          REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          if [[ ! "$TAG" =~ ^v([0-9]+\.[0-9]+\.[0-9]+)-([0-9]+)$ ]]; then
+            echo "::error::Tag '$TAG' must look like v<pi-version>-<revision>, e.g. v1.5.0-1"
+            exit 1
+          fi
+          tag_pi="${BASH_REMATCH[1]}"
+          file_pi="$(sed -n 's/^ARG PI_VERSION=//p' Dockerfile)"
+          if [[ "$tag_pi" != "$file_pi" ]]; then
+            echo "::error::Tag Pi version ($tag_pi) does not match Dockerfile PI_VERSION ($file_pi)"
+            exit 1
+          fi
+          {
+            echo "pi=$tag_pi"
+            echo "full=${TAG#v}"
+            echo "image=${REGISTRY}/${REPO,,}"
+          } >> "$GITHUB_OUTPUT"
+
+      - uses: docker/setup-qemu-action@99012661954931238ded8c8b007157a8430204e1 # v4.4.0
+      - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+
+      - name: Log in to GHCR
+        uses: docker/login-action@8aa5831fb8d48d8f76594c7ddde61ae58019f550 # v4.8.0
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Image metadata
+        id: meta
+        uses: docker/metadata-action@dc802804100637a589fabce1cb79ff13a1411302 # v6.2.0
+        with:
+          images: ${{ steps.ver.outputs.image }}
+          flavor: latest=false
+          tags: |
+            type=raw,value=${{ steps.ver.outputs.full }}
+            type=raw,value=${{ steps.ver.outputs.pi }}
+            type=raw,value=latest
+          labels: |
+            org.opencontainers.image.title=pi-agent
+            org.opencontainers.image.description=Pi coding agent (@earendil-works/pi-coding-agent) packaged for headless, sandboxed runs
+            org.opencontainers.image.licenses=MIT
+          annotations: |
+            org.opencontainers.image.description=Pi coding agent (@earendil-works/pi-coding-agent) packaged for headless, sandboxed runs
+            org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}
+            org.opencontainers.image.licenses=MIT
+        env:
+          DOCKER_METADATA_ANNOTATIONS_LEVELS: manifest,index
+
+      - name: Build and push
+        id: build
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
+        with:
+          context: .
+          platforms: linux/amd64,linux/arm64
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          annotations: ${{ steps.meta.outputs.annotations }}
+          provenance: mode=max
+          sbom: true
+          cache-from: type=gha,scope=release
+          cache-to: type=gha,mode=max,scope=release
+
+      - name: Attest build provenance
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        with:
+          subject-name: ${{ steps.ver.outputs.image }}
+          subject-digest: ${{ steps.build.outputs.digest }}
+          push-to-registry: true
+
+      - uses: sigstore/cosign-installer@756fe2d284c7292c4e9b62c8a28f1e5629c59532 # v4.1.3
+
+      - name: Sign image (cosign keyless)
+        env:
+          IMAGE: ${{ steps.ver.outputs.image }}
+          DIGEST: ${{ steps.build.outputs.digest }}
+        run: cosign sign --yes "${IMAGE}@${DIGEST}"
+
+      - name: Verify published image
+        env:
+          IMAGE: ${{ steps.ver.outputs.image }}
+          FULL: ${{ steps.ver.outputs.full }}
+          PI: ${{ steps.ver.outputs.pi }}
+        run: |
+          set -euo pipefail
+          for platform in linux/amd64 linux/arm64; do
+            got="$(docker run --rm --pull always --platform "$platform" "${IMAGE}:${FULL}" --version)"
+            echo "$platform: pi --version => $got"
+            test "$got" = "$PI"
+          done
+          src="$(docker buildx imagetools inspect "${IMAGE}:${FULL}" --format '{{ json .Image }}' \
+                 | jq -r '."linux/amd64".config.Labels."org.opencontainers.image.source"')"
+          echo "source label => $src"
+          test "$src" = "${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}"

@@ -1,0 +1,5 @@
+# DL3008 (pin apt package versions): Debian bookworm point releases remove old
+# package versions, so exact pins break rebuilds. Reproducibility comes from the
+# digest-pinned base image instead; Renovate bumps that digest.
+ignored:
+  - DL3008

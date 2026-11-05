@@ -1,0 +1,77 @@
+# Restrict pi-agent pods (label app.kubernetes.io/name=pi-agent) to:
+#   - DNS (kube-dns / CoreDNS)
+#   - HTTPS to the LLM API (Anthropic) and GitHub
+# Everything else, ingress and egress, is denied.
+#
+# Your CNI must enforce NetworkPolicy (Calico, Cilium, Antrea, ...); otherwise
+# this object is silently ignored.
+#
+# LIMITATION: core NetworkPolicy matches IP blocks only. It cannot express
+# FQDN rules like "api.anthropic.com". The CIDRs below come from published
+# ranges and drift over time:
+#   Anthropic: https://platform.claude.com/docs/en/api/ip-addresses
+#   GitHub:    https://api.github.com/meta  (keys "git", "api", "web")
+# For hostname-based egress, use a CNI extension instead, e.g. Cilium
+# CiliumNetworkPolicy `toFQDNs` or Calico (Enterprise/Cloud) `domains`, or
+# route traffic through an allowlisting egress proxy (HTTPS_PROXY).
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: pi-agent-default-deny
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/name: pi-agent
+  policyTypes: [Ingress, Egress]
+  # No ingress or egress rules => deny all. Allow rules follow below.
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: pi-agent-allow-dns
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/name: pi-agent
+  policyTypes: [Egress]
+  egress:
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: kube-system
+          podSelector:
+            matchLabels:
+              k8s-app: kube-dns
+      ports:
+        - { protocol: UDP, port: 53 }
+        - { protocol: TCP, port: 53 }
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: pi-agent-allow-egress-allowlist
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/name: pi-agent
+  policyTypes: [Egress]
+  egress:
+    # Anthropic API (api.anthropic.com), inbound ranges as published by Anthropic.
+    - to:
+        - ipBlock: { cidr: 160.79.104.0/23 }
+        - ipBlock: { cidr: 153.61.224.0/22 }
+        - ipBlock: { cidr: 2607:6bc0::/48 }
+      ports:
+        - { protocol: TCP, port: 443 }
+    # GitHub (git clone over HTTPS). Example subset of the "git" ranges from
+    # https://api.github.com/meta; regenerate it for production use.
+    - to:
+        - ipBlock: { cidr: 140.82.112.0/20 }
+        - ipBlock: { cidr: 143.55.64.0/20 }
+        - ipBlock: { cidr: 185.199.108.0/22 }
+        - ipBlock: { cidr: 192.30.252.0/22 }
+        - ipBlock: { cidr: 2606:50c0::/32 }
+        - ipBlock: { cidr: 2a0a:a440::/29 }
+      ports:
+        - { protocol: TCP, port: 443 }

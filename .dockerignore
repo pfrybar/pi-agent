@@ -1,0 +1,3 @@
+# The image installs Pi from npm and copies nothing from the build context.
+# Exclude everything so no local files (credentials, .git, etc.) are ever sent to the builder.
+*
