@@ -5,7 +5,7 @@ FROM node:24-bookworm-slim@sha256:01d566e8d94d8c619591d78652babfccd3c6992a3dffa9
 
 # Single source of truth for the Pi version. Release tags (v<PI_VERSION>-<rev>) must match it.
 # renovate: datasource=npm depName=@earendil-works/pi-coding-agent
-ARG PI_VERSION=1.5.0
+ARG PI_VERSION=1.5.2
 
 LABEL org.opencontainers.image.source="https://github.com/pfrybar/pi-agent" \
       org.opencontainers.image.title="pi-agent" \
